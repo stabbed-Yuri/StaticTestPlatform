@@ -19,7 +19,7 @@ This Arduino-based test stand is designed for precise measurement and logging of
 ### Pin Configuration
 * HX711 Data Pin: Digital Pin 8
 * HX711 Clock Pin: Digital Pin 9
-* SD Card Chip Select: Digital Pin 4
+* SD Card Chip Select: Digital Pin 10
 
 ## Features
 
@@ -132,8 +132,3 @@ The system offers multiple calibration methods:
 * Clean and inspect mechanical components
 * Ensure SD card is functioning correctly
 
-## License
-[Add appropriate open-source license information]
-
-## Contributing
-[Add guidelines for contributing to the project]
