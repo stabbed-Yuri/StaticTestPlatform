@@ -1,500 +1,415 @@
 /*
-  Simplified Model Rocket Motor Test Stand Code
-  Features:
-  - HX711 load cell integration
-  - Calibration with weight
-  - Manual calibration value adjustment
-  - Data logging (time, force)
-  - SD card logging
-  - IGNITION CONTROL REMOVED TO SAVE MEMORY
+  ESP32 Rocket Test Stand
+  SD Card Connections:
+  - CS: GPIO 5
+  - MOSI: GPIO 23
+  - MISO: GPIO 19
+  - SCK: GPIO 18
 */
 
 #include <HX711_ADC.h>
-#include <EEPROM.h>
-#include <SPI.h>
-#include <SD.h>
+#include <Preferences.h>
+#include "FS.h"
+#include "SD.h"
+#include "SPI.h"
+#include "BluetoothSerial.h"
+#include <esp_pm.h>
 
-// HX711 pins
-const int HX711_dout = 8; // MCU > HX711 dout pin
-const int HX711_sck = 9;  // MCU > HX711 sck pin
+BluetoothSerial bt;
+Preferences p;
+HX711_ADC lc(25, 26);
+File df;
 
-// SD card pins
-const int SD_CS = 10;     // Chip Select pin for SD card
+float t0=0, f=0;
+bool run=0, sd=0, bt_on=1, plot=0;
+byte m=0;
+int fn=0;
+char fn_buf[13];
+unsigned long tm=0;
+#define LED 2
 
-// HX711 constructor
-HX711_ADC LoadCell(HX711_dout, HX711_sck);
+void log_msg(const String& msg) {
+  Serial.println(msg);
+  if(bt_on) bt.println(msg);
+}
 
-// SD card file
-File dataFile;
+void initSDCard() {
+  log_msg("Initializing SD card...");
+  if(!SD.begin(5)) {
+    log_msg("SD Card Mount Failed! Check:");
+    log_msg("- CS pin connection (GPIO 5)");
+    log_msg("- SD card insertion");
+    log_msg("- SPI connections (MOSI:23,MISO:19,SCK:18)");
+    sd = false;
+    return;
+  }
+  
+  uint8_t cardType = SD.cardType();
+  if(cardType == CARD_NONE) {
+    log_msg("No SD card attached!");
+    sd = false;
+    return;
+  }
 
-// EEPROM address for calibration value
-const int calVal_eepromAdress = 0;
+  String type = "SD Card Type: ";
+  if(cardType == CARD_MMC) type += "MMC";
+  else if(cardType == CARD_SD) type += "SDSC";
+  else if(cardType == CARD_SDHC) type += "SDHC";
+  else type += "UNKNOWN";
+  log_msg(type);
 
-// Variables for thrust measurement
-float mtime = 0;       // Current time in seconds
-float force = 0;       // Force in Newtons
-float last = 0;        // Last time measurement
-bool testRunning = false;
-
-// Timing variables
-unsigned long t = 0;
-const int serialPrintInterval = 20; // Update interval in ms (increased to save processing)
-
-// SD card status
-bool sdCardPresent = false;
-
-// Operating mode (using byte instead of enum to save memory)
-#define MODE_STANDBY 0
-#define MODE_CALIBRATION 1
-#define MODE_MEASUREMENT 2
-byte currentMode = MODE_STANDBY;
-
-// Flag for serial plotter mode
-bool plotterMode = false;
-
-// Test filename counter
-int fileCounter = 0;
-char currentFileName[13]; // 8.3 filename format (12 chars + null terminator)
+  uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+  String size = "SD Card Size: ";
+  size += String(cardSize);
+  size += "MB";
+  log_msg(size);
+  
+  sd = true;
+  log_msg("SD card initialization done.");
+  
+  // Find next available file number
+  while(SD.exists(gn(fn))) fn++;
+  String nextFile = "Next test file will be: ";
+  nextFile += gn(fn);
+  log_msg(nextFile);
+}
 
 void setup() {
-  Serial.begin(57600);
-  delay(10);
+  pinMode(LED, OUTPUT);
+  Serial.begin(115200);
+  log_msg("Starting ESP32 Rocket Test Stand...");
   
-  Serial.println(F("Model Rocket Test Stand"));
+  // Configure DFS power management
+  esp_pm_config_esp32_t pm_config = {
+    .max_freq_mhz = 240, // Max CPU frequency (adjust as needed)
+    .min_freq_mhz = 40,  // Min CPU frequency (adjust as needed)
+    .light_sleep_enable = true // Allow light sleep when idle
+  };
+  esp_pm_configure(&pm_config);
   
-  // Initialize SD card
-  Serial.print(F("Initializing SD card..."));
-  if (SD.begin(SD_CS)) {
-    Serial.println(F("SD card present"));
-    sdCardPresent = true;
-    
-    // Find next available file number
-    while (SD.exists(getFileName(fileCounter))) {
-      fileCounter++;
-    }
-    Serial.print(F("Next file: TEST"));
-    Serial.print(fileCounter);
-    Serial.println(F(".CSV"));
-  } else {
-    Serial.println(F("SD card failed/missing"));
-    sdCardPresent = false;
-  }
+  log_msg("Initializing Bluetooth...");
+  bt.begin("RT");
+  log_msg("Bluetooth initialized with name: RT");
   
-  // Initialize load cell
-  LoadCell.begin();
-  float calibrationValue;
-  EEPROM.get(calVal_eepromAdress, calibrationValue);
+  initSDCard();
   
-  // Check if there is a valid calibration value in EEPROM
-  if (isnan(calibrationValue) || calibrationValue == 0) {
-    calibrationValue = 217.84; // Default value if EEPROM is empty
-  }
+  log_msg("Initializing load cell...");
+  lc.begin();
+  float calFactor = p.getFloat("c", 217.84);
+  String calMsg = "Using calibration factor: ";
+  calMsg += String(calFactor);
+  log_msg(calMsg);
+  lc.setCalFactor(calFactor);
   
-  // Set calibration value
-  LoadCell.setCalFactor(calibrationValue);
+  log_msg("Starting load cell...");
+  lc.start(2000);
+  log_msg("Waiting for first valid reading...");
+  while(!lc.update());
+  log_msg("Load cell initialized successfully");
   
-  // Start up the load cell
-  long stabilizingtime = 2000;
-  bool _tare = false;
-  LoadCell.start(stabilizingtime, _tare);
-  
-  // Check if the HX711 is properly connected
-  if (LoadCell.getTareTimeoutFlag() || LoadCell.getSignalTimeoutFlag()) {
-    Serial.println(F("Timeout, check wiring"));
-    while (1);
-  }
-  else {
-    Serial.println(F("Test Stand Ready"));
-    Serial.print(F("Cal factor: "));
-    Serial.println(calibrationValue);
-  }
-  
-  // Wait for load cell to stabilize
-  while (!LoadCell.update());
-  
-  // Print menu
-  printMenu();
+  delay(100);
+  mn();
 }
 
-// Function to generate filenames consistently
-const char* getFileName(int counter) {
-  static char filename[13];
-  sprintf(filename, "TEST%d.CSV", counter);
-  return filename;
-}
+void loop(){
+  static bool nd=0;
+  static bool ledState=0;
+  if(lc.update())nd=1;
 
-void loop() {
-  // Update load cell data
-  static bool newDataReady = 0;
-  if (LoadCell.update()) newDataReady = true;
-  
-  // Process new data
-  if (newDataReady) {
-    if (millis() > t + serialPrintInterval) {
-      newDataReady = 0;
-      t = millis();
-      
-      // Get current time and force
-      mtime = micros() / 1000000.0;
-      force = LoadCell.getData() * 0.009806; // Convert grams to Newtons
-      
-      // Log data to serial in measurement mode
-      if (currentMode == MODE_MEASUREMENT && testRunning) {
-        float grams = LoadCell.getData(); // Raw data in grams
-        
-        // Standard formatted output (when not plotting)
-        if (!plotterMode) {
-          Serial.print(mtime, 3);  // Reduced precision to save memory
-          Serial.print(F(","));
-          Serial.print(grams, 2);  // Reduced precision
-          Serial.print(F(","));
-          Serial.println(force, 3); // Reduced precision
-        } 
-        // Plotter-compatible output (just values)
-        else {
-          Serial.print(F("g:"));
-          Serial.print(grams);
-          Serial.print(F(" f:"));
-          Serial.println(force);
+  if(nd&&millis()>tm+20){
+    nd=0;
+    tm=millis();
+    t0=micros()/1e6;
+    f=lc.getData()*.009806;
+
+    if(m==1&&run){
+      String d=String(t0,3)+","+String(lc.getData(),2)+","+String(f,3);
+      if(!plot){
+        Serial.println(d);
+        if(bt_on)bt.println(d);
+      }else{
+        String p="g:"+String(lc.getData())+" f:"+String(f);
+        Serial.println(p);
+        if(bt_on)bt.println(p);
+      }
+      if(sd&&df){
+        df.println(d);
+        static byte c=0;
+        if(++c>=20){
+          df.flush();
+          c=0;
+          log_msg("Data flushed to SD card");
         }
-        
-        // Write to SD card if available
-        if (sdCardPresent && dataFile) {
-          dataFile.print(mtime, 3);
-          dataFile.print(F(","));
-          dataFile.print(grams, 2);
-          dataFile.print(F(","));
-          dataFile.println(force, 3);
-          
-          // Flush every 20 data points to prevent data loss but save processing time
-          static byte flushCounter = 0;
-          if (++flushCounter >= 20) {
-            dataFile.flush();
-            flushCounter = 0;
-          }
-        }
-        
-        last = mtime;
       }
     }
+    // LED blink logic based on HX711 input
+    if(run){
+      ledState = !ledState;
+      digitalWrite(LED, ledState);
+    } else {
+      digitalWrite(LED, LOW);
+    }
   }
-  
-  // Check for serial commands
-  if (Serial.available() > 0) {
-    char command = Serial.read();
-    processCommand(command);
+
+  if(!run){
+    digitalWrite(LED, LOW);
   }
-  
-  // Check if last tare operation is complete
-  if (LoadCell.getTareStatus() == true) {
-    Serial.println(F("Tare complete"));
+
+  if(Serial.available())cm(Serial.read());
+  if(bt.available())cm(bt.read());
+
+  if(lc.getTareStatus()){
+    log_msg("Tare completed successfully");
   }
 }
 
-void processCommand(char command) {
-  switch (command) {
-    case 't': // Tare
-      LoadCell.tareNoDelay();
-      Serial.println(F("Taring..."));
+void cm(char c){
+  String cmd = "Received command: ";
+  cmd += c;
+  log_msg(cmd);
+  
+  switch(c){
+    case't':
+      log_msg("Starting tare operation...");
+      lc.tareNoDelay();
       break;
-      
-    case 'r': // Run calibration
-      currentMode = MODE_CALIBRATION;
-      calibrate();
+    case'r':
+      log_msg("Starting full calibration...");
+      cl();
       break;
-      
-    case 'c': // Change calibration value manually
-      changeSavedCalFactor();
+    case'c':
+      log_msg("Starting manual calibration...");
+      cc();
       break;
-      
-    case 's': // Start measurement
-      startMeasurement();
+    case's':
+      log_msg("Starting test...");
+      st();
       break;
-      
-    case 'x': // Stop measurement
-      stopMeasurement();
+    case'x':
+      log_msg("Stopping test...");
+      sp();
       break;
-      
-    case 'm': // Show menu
-      printMenu();
+    case'p':
+      plot=!plot;
+      log_msg(plot ? "Plot mode enabled" : "Plot mode disabled");
       break;
-      
-    case 'p': // Toggle plotter mode
-      plotterMode = !plotterMode;
-      Serial.println(plotterMode ? F("Plotter ON") : F("Plotter OFF"));
+    case'd':
+      log_msg("Testing SD card...");
+      ts();
       break;
-      
-    case 'd': // Test SD card
-      testSDCard();
+    case'b':
+      bt_on=!bt_on;
+      log_msg(bt_on ? "Bluetooth enabled" : "Bluetooth disabled");
+      break;
+    case'm':
+      log_msg("Displaying menu...");
+      mn();
       break;
   }
 }
 
-void printMenu() {
-  Serial.println(F("\n==== ROCKET TEST STAND ===="));
-  Serial.println(F("Commands:"));
-  Serial.println(F("t - Tare scale to zero"));
-  Serial.println(F("r - Run calibration"));
-  Serial.println(F("c - Change calibration factor"));
-  Serial.println(F("s - Start measurement"));
-  Serial.println(F("x - Stop measurement"));
-  Serial.println(F("p - Toggle plotter mode"));
-  Serial.println(F("d - Test SD card"));
-  Serial.println(F("m - Show menu"));
-  Serial.println(F("=========================="));
-}
+void st(){
+  t0=micros()/1e6;
+  if(sd) {
+    // Try to reinitialize SD card if needed
+    if(!SD.begin(5)) {
+      log_msg("WARNING: SD card reinitialization needed");
+      initSDCard();
+      if(!sd) {
+        log_msg("ERROR: SD card initialization failed!");
+        return;
+      }
+    }
 
-void startMeasurement() {
-  // Reset measurement variables
-  mtime = micros() / 1000000.0;
-  last = mtime;
-  
-  if (!plotterMode) {
-    Serial.println(F("MEASUREMENT STARTED"));
-    Serial.println(F("Time(s),Weight(g),Force(N)"));
-  }
-  
-  // Open a new file on SD card if available
-  if (sdCardPresent) {
-    // Create a new file name
-    strcpy(currentFileName, getFileName(fileCounter));
-    dataFile = SD.open(currentFileName, FILE_WRITE);
+    strcpy(fn_buf, gn(fn));
+    String fileMsg = "Creating new test file: ";
+    fileMsg += fn_buf;
+    log_msg(fileMsg);
     
-    if (dataFile) {
-      Serial.print(F("Logging to: "));
-      Serial.println(currentFileName);
+    // First try to remove any existing file
+    if(SD.exists(fn_buf)) {
+      log_msg("Removing existing file...");
+      SD.remove(fn_buf);
+    }
+    
+    df = SD.open(fn_buf, FILE_WRITE);
+    if(!df) {
+      log_msg("ERROR: Failed to create data file!");
+      log_msg("Check:");
+      log_msg("- SD card write protection");
+      log_msg("- Available space");
+      log_msg("- File system errors");
       
-      // Write header to file
-      dataFile.println(F("Time(s),Weight(g),Force(N)"));
-      dataFile.flush();
+      // Try to diagnose the issue
+      uint64_t freeSpace = SD.totalBytes() - SD.usedBytes();
+      String space = "Available space: ";
+      space += String((int)(freeSpace / 1024));
+      space += "KB";
+      log_msg(space);
       
-      // Increment file counter for next test
-      fileCounter++;
+      // Try to write in root directory
+      File test = SD.open("/test.txt", FILE_WRITE);
+      if(!test) {
+        log_msg("ERROR: Cannot write to root directory!");
     } else {
-      Serial.println(F("Error opening file!"));
-    }
-  } else {
-    Serial.println(F("SD card not available"));
-  }
-  
-  currentMode = MODE_MEASUREMENT;
-  testRunning = true;
-}
-
-void stopMeasurement() {
-  testRunning = false;
-  
-  // Close the data file if open
-  if (dataFile) {
-    dataFile.close();
-    Serial.print(F("Data saved to "));
-    Serial.println(currentFileName);
-  }
-  
-  if (!plotterMode) {
-    Serial.println(F("MEASUREMENT STOPPED"));
-  }
-  
-  currentMode = MODE_STANDBY;
-}
-
-void calibrate() {
-  Serial.println(F("*** CALIBRATION ***"));
-  Serial.println(F("Remove any load."));
-  Serial.println(F("Send 't' to tare."));
-
-  bool _resume = false;
-  while (_resume == false) {
-    LoadCell.update();
-    if (Serial.available() > 0) {
-      char inByte = Serial.read();
-      if (inByte == 't') {
-        LoadCell.tareNoDelay();
+        test.close();
+        SD.remove("/test.txt");
+        log_msg("Root directory is writable");
       }
-    }
-    if (LoadCell.getTareStatus() == true) {
-      Serial.println(F("Tare complete"));
-      _resume = true;
-    }
-  }
-
-  Serial.println(F("Place calibration weight"));
-  Serial.println(F("Send weight in grams"));
-
-  float known_mass = 0;
-  _resume = false;
-  while (_resume == false) {
-    LoadCell.update();
-    if (Serial.available() > 0) {
-      known_mass = Serial.parseFloat();
-      if (known_mass != 0) {
-        Serial.print(F("Known mass: "));
-        Serial.println(known_mass);
-        _resume = true;
-      }
-    }
-  }
-
-  LoadCell.refreshDataSet(); // Refresh dataset for accuracy
-  float newCalibrationValue = LoadCell.getNewCalibration(known_mass);
-
-  Serial.print(F("New cal value: "));
-  Serial.println(newCalibrationValue);
-  Serial.print(F("Save to EEPROM? (y/n): "));
-
-  _resume = false;
-  while (_resume == false) {
-    if (Serial.available() > 0) {
-      char inByte = Serial.read();
-      if (inByte == 'y') {
-        EEPROM.put(calVal_eepromAdress, newCalibrationValue);
-        Serial.print(F("Value saved: "));
-        Serial.println(newCalibrationValue);
-        _resume = true;
-      }
-      else if (inByte == 'n') {
-        Serial.println(F("Value not saved"));
-        _resume = true;
-      }
-    }
-  }
-
-  // Set the new calibration value
-  LoadCell.setCalFactor(newCalibrationValue);
-  
-  Serial.println(F("Calibration complete"));
-  
-  currentMode = MODE_STANDBY;
-  printMenu();
-}
-
-void changeSavedCalFactor() {
-  float currentCalibrationValue = LoadCell.getCalFactor();
-  
-  Serial.println(F("*** MANUAL CALIBRATION ***"));
-  Serial.print(F("Current: "));
-  Serial.println(currentCalibrationValue);
-  Serial.println(F("Enter new value:"));
-
-  bool _resume = false;
-  float newCalibrationValue;
-  
-  while (_resume == false) {
-    if (Serial.available() > 0) {
-      newCalibrationValue = Serial.parseFloat();
-      if (newCalibrationValue != 0) {
-        Serial.print(F("New value: "));
-        Serial.println(newCalibrationValue);
-        LoadCell.setCalFactor(newCalibrationValue);
-        _resume = true;
-      }
-    }
-  }
-  
-  Serial.print(F("Save to EEPROM? (y/n): "));
-  
-  _resume = false;
-  while (_resume == false) {
-    if (Serial.available() > 0) {
-      char inByte = Serial.read();
-      if (inByte == 'y') {
-        EEPROM.put(calVal_eepromAdress, newCalibrationValue);
-        Serial.print(F("Value saved: "));
-        Serial.println(newCalibrationValue);
-        _resume = true;
-      }
-      else if (inByte == 'n') {
-        Serial.println(F("Value not saved"));
-        _resume = true;
-      }
-    }
-  }
-  
-  currentMode = MODE_STANDBY;
-  printMenu();
-}
-
-void testSDCard() {
-  Serial.println(F("*** TESTING SD CARD ***"));
-  
-  // Check if SD card is initialized
-  if (!sdCardPresent) {
-    Serial.println(F("SD card not initialized. Trying..."));
-    if (SD.begin(SD_CS)) {
-      Serial.println(F("SD card initialized!"));
-      sdCardPresent = true;
-    } else {
-      Serial.println(F("SD card failed! Check wiring."));
       return;
     }
-  } else {
-    Serial.println(F("SD card is present."));
-  }
-  
-  // Test write/read operations
-  const char testFileName[] = "TEST_SD.TXT";
-  Serial.print(F("Creating test file: "));
-  Serial.println(testFileName);
-  
-  // Try to create and write to a test file
-  File testFile = SD.open(testFileName, FILE_WRITE);
-  if (testFile) {
-    testFile.println(F("SD Card Test File"));
-    testFile.println(F("If you can read this, SD card works!"));
-    testFile.close();
-    Serial.println(F("Test file written."));
     
-    // Try to read the file back
-    testFile = SD.open(testFileName);
-    if (testFile) {
-      Serial.println(F("Reading test file:"));
-      Serial.println(F("---------------------"));
-      while (testFile.available()) {
-        Serial.write(testFile.read());
-      }
-      Serial.println(F("\n---------------------"));
-      testFile.close();
-      
-      // List root directory content
-      Serial.println(F("Files on SD card:"));
-      File root = SD.open("/");
-      printDirectory(root, 0);
-      root.close();
-      
-      Serial.println(F("SD card test successful!"));
-    } else {
-      Serial.println(F("Error reading test file!"));
+    log_msg("Test file created successfully");
+    if(!df.println("t,w,f")) {
+      log_msg("ERROR: Failed to write header!");
+      df.close();
+      return;
     }
+    df.flush();
+    fn++;
   } else {
-    Serial.println(F("Error creating test file!"));
+    log_msg("WARNING: SD card not available, proceeding without logging");
   }
+  m=1;
+  run=1;
+  log_msg("Test started");
 }
 
-void printDirectory(File dir, int numTabs) {
-  while (true) {
-    File entry = dir.openNextFile();
-    if (!entry) {
-      // No more files
-      break;
-    }
-    
-    // Print filename with tabs for hierarchy
-    for (uint8_t i = 0; i < numTabs; i++) {
-      Serial.print('\t');
-    }
-    
-    Serial.print(entry.name());
-    
-    if (entry.isDirectory()) {
-      Serial.println(F("/"));
-      printDirectory(entry, numTabs + 1);
-    } else {
-      // Print file size
-      Serial.print(F("\t\t"));
-      Serial.print(entry.size(), DEC);
-      Serial.println(F(" bytes"));
-    }
-    
-    entry.close();
+void sp(){
+  run=0;
+  if(df){
+    df.close();
+    String stopMsg = "Test stopped and file saved: ";
+    stopMsg += fn_buf;
+    log_msg(stopMsg);
+  } else {
+    log_msg("Test stopped (no file was open)");
   }
+  m=0;
+}
+
+void cl(){
+  log_msg("Starting full calibration procedure");
+  log_msg("Remove all weight and send 't' when ready");
+  
+  while(!lc.getTareStatus()){
+    lc.update();
+    if(Serial.available()&&Serial.read()=='t')lc.tareNoDelay();
+    if(bt.available()&&bt.read()=='t')lc.tareNoDelay();
+  }
+  
+  log_msg("Tare complete. Place known weight and enter weight in grams:");
+  
+  while(!Serial.available()&&!bt.available())lc.update();
+  float ms=Serial.available()?Serial.parseFloat():bt.parseFloat();
+  if(ms<=0){
+    log_msg("Invalid weight entered, calibration aborted");
+    return;
+  }
+  
+  log_msg("Calculating new calibration factor...");
+  lc.refreshDataSet();
+  float c=lc.getNewCalibration(ms);
+  String calMsg = "Proposed calibration factor: ";
+  calMsg += String(c);
+  log_msg(calMsg);
+  log_msg("Accept? (y/n)");
+  
+  while(!Serial.available()&&!bt.available())delay(10);
+  if((Serial.available()&&Serial.read()=='y')||(bt.available()&&bt.read()=='y')){
+    p.putFloat("c",c);
+    lc.setCalFactor(c);
+    String newCalMsg = "New calibration factor saved: ";
+    newCalMsg += String(c);
+    log_msg(newCalMsg);
+  } else if((Serial.available()&&Serial.read()=='n')||(bt.available()&&bt.read()=='n')) {
+    log_msg("Calibration cancelled");
+  }
+  m=0;
+}
+
+void cc(){
+  String currentCal = "Current calibration factor: ";
+  currentCal += String(lc.getCalFactor());
+  log_msg(currentCal);
+  log_msg("Enter new calibration factor:");
+  
+  while(!Serial.available()&&!bt.available())delay(10);
+  float c=Serial.available()?Serial.parseFloat():bt.parseFloat();
+  if(c<=0){
+    log_msg("Invalid calibration factor, operation cancelled");
+    return;
+  }
+  
+  lc.setCalFactor(c);
+  log_msg("Test new calibration factor. Accept? (y/n)");
+  
+  while(!Serial.available()&&!bt.available())delay(10);
+  if((Serial.available()&&Serial.read()=='y')||(bt.available()&&bt.read()=='y')){
+    p.putFloat("c",c);
+    String newCalMsg = "New calibration factor saved: ";
+    newCalMsg += String(c);
+    log_msg(newCalMsg);
+  } else {
+    log_msg("Calibration change cancelled");
+  }
+  m=0;
+}
+
+void ts(){
+  log_msg("Starting SD card test...");
+  
+  if(!sd && !SD.begin(5)) {
+    log_msg("ERROR: SD initialization failed!");
+    log_msg("Check SD card connections");
+      return;
+  }
+  
+  log_msg("Creating test file...");
+  File f = SD.open("/test.txt", FILE_WRITE);
+  if(!f) {
+    log_msg("ERROR: File creation failed!");
+    log_msg("Check:");
+    log_msg("- SD card write protection");
+    log_msg("- Available space");
+    log_msg("- File system errors");
+    return;
+  }
+  f.println("SD Card Test OK");
+  f.close();
+    
+    // Try to read the file back
+  f = SD.open("/test.txt");
+  if(!f) {
+    log_msg("ERROR: Failed to read test file!");
+    return;
+  }
+  
+  String content = f.readString();
+  f.close();
+  
+  // Delete test file
+  SD.remove("/test.txt");
+  
+  log_msg("SD card test completed successfully");
+  log_msg("Read test content: " + content);
+}
+
+void mn(){
+  log_msg("\n=== MENU ===");
+  log_msg("t - Tare load cell");
+  log_msg("r - Run full calibration");
+
+  log_msg("s - Start test");
+  log_msg("x - Stop test");
+  log_msg("d - Test SD card");
+
+  log_msg("m - Show this menu");
+  log_msg("===========");
+}
+
+const char* gn(int n){
+  static char n_[13];
+  sprintf(n_,"/T%d.CSV",n);  // Add leading slash for root directory
+  return n_;
 }
